@@ -23,7 +23,7 @@
     <style>
         .box {
             width: 100px; height: 100px;    
-            position: absolute; /* 이 한 줄 때문에 달라짐, 절대 좌표(0,0), 만들어진 것 위에 또 만들어져서 쌓임, 상대좌표면 그 다음에 박스가 만들어짐, 절대좌표면 그 위에 만들어짐, 상대좌표가 기본값 */
+            position: absolute;
         }
         .box:nth-child(1) {background-color: red;}
         .box:nth-child(2) {background-color: green;}
