@@ -1,0 +1,652 @@
+# 라이브러리 설치
+!pip install open_clip_torch --quiet
+!pip install pandas --quiet
+--
+# 기본 설정 + 데이터 압축 해제
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+import zipfile
+import random
+
+import torch
+from torch.utils.data import Subset, DataLoader
+from torchvision import datasets
+
+import open_clip
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from PIL import Image
+
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+import torch.nn as nn
+import torch.optim as optim
+
+# 디바이스 설정
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# 데이터 경로
+# 본인의 Google Drive에 train_data.zip 업로드 후 사용
+zip_path = "/content/drive/MyDrive/train_data.zip"
+data_dir = "/content/train_data"
+
+# 압축 해제
+if not os.path.exists(data_dir) or len(os.listdir(data_dir)) == 0:
+    os.makedirs(data_dir, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(data_dir)
+--
+# CLIP 모델 불러오기 + ImageFolder 로드
+# CLIP 모델 (ViT-B-32, openai 가중치)
+clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+    'ViT-B-32',
+    pretrained='openai'
+)
+clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
+clip_model.to(device)
+clip_model.eval()
+
+# ImageFolder 로드 (CLIP용 전처리 사용)
+full_dataset_clip = datasets.ImageFolder(root=data_dir, transform=clip_preprocess)
+
+class_names = full_dataset_clip.classes
+num_classes = len(class_names)
+
+print("클래스 이름:", class_names)
+print("클래스 수:", num_classes)
+print("전체 이미지 수:", len(full_dataset_clip))
+--
+# 클래스별 8:2 stratified train/val split
+# 각 클래스마다 8장 train, 2장 val
+# ImageFolder.samples = [(경로, 라벨인덱스), ...]
+labels = [label for _, label in full_dataset_clip.samples]
+
+indices_per_class = {c: [] for c in range(num_classes)}
+for idx, label in enumerate(labels):
+    indices_per_class[label].append(idx)
+
+train_indices = []
+val_indices = []
+
+random.seed(42)  # 항상 같은 방식으로 나누기
+for c in range(num_classes):
+    idxs = indices_per_class[c]
+    # 이 데이터셋은 클래스당 10장이라고 가정 (>=2장인지 확인)
+    assert len(idxs) >= 2, f"class {c} has less than 2 samples"
+    random.shuffle(idxs)
+    n_val = max(1, int(len(idxs) * 0.2))  # 10장 → 2장
+    val_indices.extend(idxs[:n_val])
+    train_indices.extend(idxs[n_val:])
+
+train_indices.sort()
+val_indices.sort()
+
+print("총 train 개수:", len(train_indices))
+print("총 val 개수:", len(val_indices))
+
+# 각 클래스별 train/val 개수 확인
+def count_by_class(indices, labels, num_classes):
+    counts = {c: 0 for c in range(num_classes)}
+    for i in indices:
+        counts[labels[i]] += 1
+    return counts
+
+train_counts = count_by_class(train_indices, labels, num_classes)
+val_counts = count_by_class(val_indices, labels, num_classes)
+
+print("\n[클래스별 개수] (라벨 인덱스 기준)")
+for c in range(num_classes):
+    print(f"{c:2d} ({class_names[c]:12s}) - train: {train_counts[c]}, val: {val_counts[c]}")
+--
+# CLIP용 train/val Subset + DataLoader 생성
+train_dataset_clip = Subset(full_dataset_clip, train_indices)
+val_dataset_clip   = Subset(full_dataset_clip, val_indices)
+
+train_loader_clip = DataLoader(train_dataset_clip, batch_size=16, shuffle=False)
+val_loader_clip   = DataLoader(val_dataset_clip, batch_size=16, shuffle=False)
+
+print("train_dataset_clip 크기:", len(train_dataset_clip))
+print("val_dataset_clip 크기:", len(val_dataset_clip))
+--
+# CLIP 텍스트 프롬프트 정의 + zero-shot 텍스트 임베딩
+prompt_templates = {
+    "front":       "a photo of the front of a car",
+    "rear":        "a photo of the rear of a car",
+    "left":        "a photo of the left side of a car",
+    "right":       "a photo of the right side of a car",
+    "front_left":  "a front-left diagonal view of a car",
+    "front_right": "a front-right diagonal view of a car",
+    "rear_left":   "a rear-left diagonal view of a car",
+    "rear_right":  "a rear-right diagonal view of a car",
+    "inside":      "an interior photo of a car showing seats or dashboard",
+    "tire":        "a close-up photo of a car tire or wheel"
+}
+
+texts = [prompt_templates[c] for c in class_names]
+print("사용할 텍스트 프롬프트:")
+for t in texts:
+    print(" -", t)
+
+text_tokens = clip_tokenizer(texts).to(device)
+
+with torch.no_grad():
+    text_features = clip_model.encode_text(text_tokens)
+    text_features /= text_features.norm(dim=-1, keepdim=True)  # 정규화
+--
+# CLIP zero-shot 평가 (학습 없이 텍스트만 사용)
+def evaluate_clip_zero_shot(model, data_loader, text_features, device):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, labels in tqdm(data_loader, desc="CLIP Zero-shot Eval"):
+            images = images.to(device)
+            labels = labels.to(device)
+
+            image_features = model.encode_image(images)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+
+            logits = 100.0 * image_features @ text_features.T
+            preds = torch.argmax(logits, dim=-1)
+
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+    acc = correct / total * 100.0
+    return acc
+
+train_acc_zeroshot = evaluate_clip_zero_shot(clip_model, train_loader_clip, text_features, device)
+val_acc_zeroshot   = evaluate_clip_zero_shot(clip_model, val_loader_clip, text_features, device)
+
+print(f"\n[CLIP Zero-shot] Train Acc: {train_acc_zeroshot:.2f}%")
+print(f"[CLIP Zero-shot] Val   Acc: {val_acc_zeroshot:.2f}%")
+--
+# CLIP Zero-shot 전체 이미지 예측 CSV
+rows = []
+for img_path, _ in tqdm(full_dataset_clip.samples, desc="CLIP Zero-shot 전체 예측"):
+    img = Image.open(img_path).convert("RGB")
+    img_tensor = clip_preprocess(img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        img_feat = clip_model.encode_image(img_tensor)
+        img_feat /= img_feat.norm(dim=-1, keepdim=True)
+        logits = 100.0 * img_feat @ text_features.T
+        pred_idx = int(torch.argmax(logits, dim=-1).item())
+
+    pred_label = class_names[pred_idx]
+    filename = os.path.basename(img_path)
+    rows.append({"filename": filename, "prediction": pred_label})
+
+df_zeroshot = pd.DataFrame(rows)
+zeroshot_csv_path = "/content/clip_zeroshot_result.csv"
+df_zeroshot.to_csv(zeroshot_csv_path, index=False)
+print("CLIP zero-shot 예측 CSV 저장:", zeroshot_csv_path)
+--
+# CLIP 이미지 feature 추출 (train/val) + Linear classifier 학습
+def extract_features(dataset, model, device):
+    loader = DataLoader(dataset, batch_size=16, shuffle=False)
+    all_feats = []
+    all_labels = []
+
+    model.eval()
+    with torch.no_grad():
+        for imgs, labels in tqdm(loader, desc="CLIP Feature 추출"):
+            imgs = imgs.to(device)
+            feats = model.encode_image(imgs)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            all_feats.append(feats.cpu())
+            all_labels.append(labels)
+
+    all_feats = torch.cat(all_feats, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    return all_feats, all_labels
+
+train_feats, train_labels = extract_features(train_dataset_clip, clip_model, device)
+val_feats, val_labels = extract_features(val_dataset_clip, clip_model, device)
+
+print("train_feats shape:", train_feats.shape)
+print("val_feats shape:", val_feats.shape)
+--
+# CLIP 이미지 feature 추출 (train/val) + Linear classifier 학습
+def extract_features(dataset, model, device):
+    loader = DataLoader(dataset, batch_size=16, shuffle=False)
+    all_feats = []
+    all_labels = []
+
+    model.eval()
+    with torch.no_grad():
+        for imgs, labels in tqdm(loader, desc="CLIP Feature 추출"):
+            imgs = imgs.to(device)
+            feats = model.encode_image(imgs)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            all_feats.append(feats.cpu())
+            all_labels.append(labels)
+
+    all_feats = torch.cat(all_feats, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    return all_feats, all_labels
+
+train_feats, train_labels = extract_features(train_dataset_clip, clip_model, device)
+val_feats, val_labels = extract_features(val_dataset_clip, clip_model, device)
+
+print("train_feats shape:", train_feats.shape)
+print("val_feats shape:", val_feats.shape)
+--
+# Linear classifier (CLIP feature → 10 클래스) 학습
+feature_dim = train_feats.shape[1]
+print("feature_dim:", feature_dim, "num_classes:", num_classes)
+
+classifier = nn.Linear(feature_dim, num_classes).to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(classifier.parameters(), lr=1e-2, weight_decay=1e-4)
+
+train_ds_feat = torch.utils.data.TensorDataset(train_feats, train_labels)
+val_ds_feat   = torch.utils.data.TensorDataset(val_feats, val_labels)
+
+train_loader_feat = DataLoader(train_ds_feat, batch_size=16, shuffle=True)
+val_loader_feat   = DataLoader(val_ds_feat, batch_size=16, shuffle=False)
+
+def train_classifier_one_epoch(classifier, loader, optimizer, criterion, device):
+    classifier.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for feats, labels in loader:
+        feats = feats.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = classifier(feats)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * feats.size(0)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += feats.size(0)
+
+    return total_loss / total, correct / total * 100.0
+
+def eval_classifier(classifier, loader, criterion, device):
+    classifier.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for feats, labels in loader:
+            feats = feats.to(device)
+            labels = labels.to(device)
+
+            outputs = classifier(feats)
+            loss = criterion(outputs, labels)
+
+            total_loss += loss.item() * feats.size(0)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += feats.size(0)
+
+    return total_loss / total, correct / total * 100.0
+
+EPOCHS = 50
+best_val_acc = 0.0
+best_state = None
+
+for epoch in range(1, EPOCHS + 1):
+    train_loss, train_acc = train_classifier_one_epoch(
+        classifier, train_loader_feat, optimizer, criterion, device
+    )
+    val_loss, val_acc = eval_classifier(
+        classifier, val_loader_feat, criterion, device
+    )
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        best_state = classifier.state_dict()
+
+    print(f"[Epoch {epoch:02d}] "
+          f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | "
+          f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+
+print("\n최고 검증 정확도 (CLIP feature + Linear classifier): "
+      f"{best_val_acc:.2f}%")
+
+if best_state is not None:
+    classifier.load_state_dict(best_state)
+    print("<Best linear classifier weights loaded>")
+--
+# CLIP+Linear 전체 이미지 예측 CSV
+rows = []
+clip_model.eval()
+classifier.eval()
+
+with torch.no_grad():
+    for idx in tqdm(range(len(full_dataset_clip)), desc="CLIP+Linear 전체 예측"):
+        img, _ = full_dataset_clip[idx]
+        img = img.to(device).unsqueeze(0)
+
+        feat = clip_model.encode_image(img)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+
+        logits = classifier(feat)
+        pred_idx = int(logits.argmax(dim=1).item())
+        pred_label = class_names[pred_idx]
+
+        img_path, _ = full_dataset_clip.samples[idx]
+        filename = os.path.basename(img_path)
+
+        rows.append({"filename": filename, "prediction": pred_label})
+
+df_clip_linear = pd.DataFrame(rows)
+clip_linear_csv_path = "/content/clip_linear_result.csv"
+df_clip_linear.to_csv(clip_linear_csv_path, index=False)
+print("CLIP+Linear 예측 CSV 저장:", clip_linear_csv_path)
+--
+# CLIP+Linear 검증 셋 클래스별 정확도 + 혼동행렬
+from collections import Counter
+
+num_classes = len(class_names)
+
+conf_mat = np.zeros((num_classes, num_classes), dtype=int)
+val_counts = Counter()
+val_correct_counts = Counter()
+
+clip_model.eval()
+classifier.eval()
+
+for i in tqdm(range(len(val_dataset_clip)), desc="Val 분석 (CLIP+Linear)"):
+    img, true_label = val_dataset_clip[i]
+    img = img.to(device).unsqueeze(0)
+
+    with torch.no_grad():
+        feat = clip_model.encode_image(img)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+        logits = classifier(feat)
+        pred_label = int(logits.argmax(dim=1).item())
+
+    conf_mat[true_label, pred_label] += 1
+    val_counts[true_label] += 1
+    if pred_label == true_label:
+        val_correct_counts[true_label] += 1
+
+print("\n[클래스별 검증 정확도 - CLIP+Linear]")
+for cls_idx, cls_name in enumerate(class_names):
+    total = val_counts[cls_idx]
+    correct = val_correct_counts[cls_idx]
+    acc = (correct / total * 100) if total > 0 else 0.0
+    print(f"{cls_name:12s} : {correct:2d} / {total:2d}  ({acc:.1f}%)")
+
+print("\n[Confusion Matrix] (행=실제, 열=예측)")
+print("     " + "  ".join([f"{name[:4]:>4s}" for name in class_names]))
+for i, row in enumerate(conf_mat):
+    row_str = "  ".join([f"{v:4d}" for v in row])
+    print(f"{class_names[i][:4]:>4s}  {row_str}")
+--
+# ViT_B_16 (이미지 전용 모델) 학습 (같은 split 사용)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("사용 디바이스:", device)
+
+weights = ViT_B_16_Weights.IMAGENET1K_V1
+vit_transform = weights.transforms()
+
+full_dataset_vit = datasets.ImageFolder(data_dir, transform=vit_transform)
+
+vit_train_dataset = Subset(full_dataset_vit, train_indices)
+vit_val_dataset   = Subset(full_dataset_vit, val_indices)
+
+vit_train_loader = DataLoader(vit_train_dataset, batch_size=16, shuffle=True)
+vit_val_loader   = DataLoader(vit_val_dataset, batch_size=16, shuffle=False)
+
+print("ViT train size:", len(vit_train_dataset))
+print("ViT val size:", len(vit_val_dataset))
+
+num_classes_vit = len(full_dataset_vit.classes)
+print("클래스 수:", num_classes_vit, "→", full_dataset_vit.classes)
+
+vit_model = vit_b_16(weights=weights)
+vit_model.heads.head = nn.Linear(vit_model.heads.head.in_features, num_classes_vit)
+vit_model = vit_model.to(device)
+
+criterion_vit = nn.CrossEntropyLoss()
+optimizer_vit = torch.optim.AdamW(vit_model.parameters(), lr=1e-4, weight_decay=1e-3)
+
+def train_vit_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for imgs, labels in tqdm(loader, desc="ViT Train"):
+        imgs, labels = imgs.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * imgs.size(0)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += imgs.size(0)
+
+    return total_loss / total, correct / total * 100.0
+
+def eval_vit(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for imgs, labels in tqdm(loader, desc="ViT Val"):
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+
+            total_loss += loss.item() * imgs.size(0)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += imgs.size(0)
+
+    return total_loss / total, correct / total * 100.0
+
+EPOCHS_VIT = 10
+best_vit_val_acc = 0.0
+best_vit_state = None
+
+for epoch in range(1, EPOCHS_VIT + 1):
+    train_loss, train_acc = train_vit_one_epoch(vit_model, vit_train_loader, optimizer_vit, criterion_vit, device)
+    val_loss, val_acc = eval_vit(vit_model, vit_val_loader, criterion_vit, device)
+
+    print(f"[ViT Epoch {epoch:02d}] "
+          f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | "
+          f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+
+    if val_acc > best_vit_val_acc:
+        best_vit_val_acc = val_acc
+        best_vit_state = vit_model.state_dict()
+
+print("\nViT 최고 검증 정확도:", best_vit_val_acc, "%")
+
+if best_vit_state is not None:
+    vit_model.load_state_dict(best_vit_state)
+    print("<Best ViT weights loaded>")
+--
+# ViT 전체 이미지 예측 CSV 생성
+# vit_model: 위에서 학습 & <Best ViT weights loaded> 상태
+# full_dataset_vit: ImageFolder(data_dir, transform=vit_transform)
+# class_names: CLIP 쪽에서 썼던 클래스 이름 리스트 (순서 동일)
+import os
+import pandas as pd
+from tqdm import tqdm
+
+rows = []
+vit_model.eval()
+
+with torch.no_grad():
+    for idx in tqdm(range(len(full_dataset_vit)), desc="ViT 전체 예측"):
+        img, _ = full_dataset_vit[idx]
+        img = img.to(device).unsqueeze(0)   # [1, C, H, W]
+
+        outputs = vit_model(img)            # [1, num_classes]
+        pred_idx = int(outputs.argmax(dim=1).item())
+        pred_label = class_names[pred_idx]
+
+        img_path, _ = full_dataset_vit.samples[idx]
+        filename = os.path.basename(img_path)
+
+        rows.append({"filename": filename, "prediction": pred_label})
+
+df_vit = pd.DataFrame(rows)
+vit_csv_path = "/content/vit_result.csv"
+df_vit.to_csv(vit_csv_path, index=False)
+print("ViT 예측 CSV 저장:", vit_csv_path)
+--
+import numpy as np
+from collections import Counter
+from tqdm import tqdm
+
+# ViT용 val 데이터셋과 클래스 이름
+class_names = vit_val_dataset.dataset.classes   # ImageFolder 클래스 순서
+num_classes = len(class_names)
+
+conf_mat = np.zeros((num_classes, num_classes), dtype=int)
+val_counts = Counter()
+val_correct_counts = Counter()
+
+vit_model.eval()
+
+with torch.no_grad():
+    for img, true_label in tqdm(vit_val_dataset, desc="ViT Val 분석"):
+        # img: tensor, true_label: int (클래스 인덱스)
+        img = img.to(device).unsqueeze(0)
+
+        outputs = vit_model(img)
+        pred_label = int(outputs.argmax(dim=1).item())
+
+        # 혼동행렬 (행=실제, 열=예측)
+        conf_mat[true_label, pred_label] += 1
+
+        # 클래스별 카운트
+        val_counts[true_label] += 1
+        if pred_label == true_label:
+            val_correct_counts[true_label] += 1
+
+print("\n[ViT 클래스별 검증 정확도]")
+for cls_idx, cls_name in enumerate(class_names):
+    total = val_counts[cls_idx]
+    correct = val_correct_counts[cls_idx]
+    acc = (correct / total * 100) if total > 0 else 0.0
+    print(f"{cls_name:12s}: {correct:2d} / {total:2d} ({acc:.1f}%)")
+
+print("\n[ViT Confusion Matrix] (행 = 실제, 열 = 예측)")
+header = "         " + "  ".join([f"{name[:4]:>4s}" for name in class_names])
+print(header)
+for i, row in enumerate(conf_mat):
+    row_str = "  ".join([f"{v:4d}" for v in row])
+    print(f"{class_names[i][:8]:>8s}  {row_str}")
+--
+# CLIP+Linear vs ViT vs Ensemble (val set 비교)
+# val_indices : stratified 8:2로 만든 인덱스 리스트
+# labels : 전체 100장에 대한 정답 라벨 인덱스 리스트
+# full_dataset_clip, full_dataset_vit : 같은 순서로 로드된 ImageFolder
+clip_model.eval()
+classifier.eval()
+vit_model.eval()
+
+correct_clip = 0
+correct_vit = 0
+correct_ens = 0
+total = len(val_indices)
+
+with torch.no_grad():
+    for idx in val_indices:
+        # 정답 라벨 (숫자 인덱스)
+        true_label = labels[idx]
+
+        # CLIP용 이미지 (clip_preprocess 적용된 버전)
+        img_clip, _ = full_dataset_clip[idx]
+        img_clip = img_clip.to(device).unsqueeze(0)
+
+        # ViT용 이미지 (vit_transform 적용된 버전)
+        img_vit, _ = full_dataset_vit[idx]
+        img_vit = img_vit.to(device).unsqueeze(0)
+
+        # CLIP+Linear
+        feat = clip_model.encode_image(img_clip)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+        logits_clip = classifier(feat)              # [1, num_classes]
+
+        # ViT
+        logits_vit = vit_model(img_vit)             # [1, num_classes]
+
+        # Ensemble (합)
+        logits_ens = logits_clip + logits_vit
+
+        pred_clip = int(logits_clip.argmax(dim=1).item())
+        pred_vit  = int(logits_vit.argmax(dim=1).item())
+        pred_ens  = int(logits_ens.argmax(dim=1).item())
+
+        if pred_clip == true_label:
+            correct_clip += 1
+        if pred_vit == true_label:
+            correct_vit += 1
+        if pred_ens == true_label:
+            correct_ens += 1
+
+acc_clip = correct_clip / total * 100.0
+acc_vit  = correct_vit  / total * 100.0
+acc_ens  = correct_ens  / total * 100.0
+
+print(f"\n[Val Accuracy 비교]")
+print(f"CLIP + Linear  : {acc_clip:.2f}%  ({correct_clip}/{total})")
+print(f"ViT_B_16       : {acc_vit:.2f}%  ({correct_vit}/{total})")
+print(f"Ensemble(합산) : {acc_ens:.2f}%  ({correct_ens}/{total})")
+--
+# Ensemble 전체 이미지 예측 CSV 생성
+# CLIP+Linear logits + ViT logits 를 합산해서 최종 예측
+
+rows = []
+
+clip_model.eval()
+classifier.eval()
+vit_model.eval()
+
+with torch.no_grad():
+    for idx in tqdm(range(len(full_dataset_clip)), desc="Ensemble 전체 예측"):
+        # 이미지 (각 모델용 전처리 버전)
+        img_clip, _ = full_dataset_clip[idx]
+        img_vit, _  = full_dataset_vit[idx]
+
+        img_clip = img_clip.to(device).unsqueeze(0)
+        img_vit  = img_vit.to(device).unsqueeze(0)
+
+        # CLIP+Linear logits
+        feat = clip_model.encode_image(img_clip)
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+        logits_clip = classifier(feat)
+
+        # ViT logits
+        logits_vit = vit_model(img_vit)
+
+        # Ensemble logits
+        logits_ens = logits_clip + logits_vit
+        pred_idx = int(logits_ens.argmax(dim=1).item())
+        pred_label = class_names[pred_idx]
+
+        img_path, _ = full_dataset_clip.samples[idx]
+        filename = os.path.basename(img_path)
+
+        rows.append({"filename": filename, "prediction": pred_label})
+
+df_ens = pd.DataFrame(rows)
+ens_csv_path = "/content/ensemble_result.csv"
+df_ens.to_csv(ens_csv_path, index=False)
+print("Ensemble 예측 CSV 저장:", ens_csv_path)
